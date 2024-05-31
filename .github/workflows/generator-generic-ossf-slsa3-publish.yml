@@ -13,6 +13,10 @@
 name: SLSA generic generator
 on:
   workflow_dispatch:
+  push:
+  pull_request:
+    branches:
+      - main
   release:
     types: [created]
 
@@ -24,26 +28,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      # ========================================================
-      #
-      # Step 1: Build your artifacts.
-      #
-      # ========================================================
       - name: Build artifacts
         run: |
             # These are some amazing artifacts.
             echo "artifact1" > artifact1
             echo "artifact2" > artifact2
 
-      # ========================================================
-      #
-      # Step 2: Add a step to generate the provenance subjects
-      #         as shown below. Update the sha256 sum arguments
-      #         to include all binaries that you generate
-      #         provenance for.
-      #
-      # ========================================================
       - name: Generate subject for provenance
         id: hash
         run: |
@@ -53,14 +43,67 @@ jobs:
           files=$(ls artifact*)
           # Generate the subjects (base64 encoded).
           echo "hashes=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}"
-
-  provenance:
-    needs: [build]
+  slsa-setup:
     permissions:
-      actions: read   # To read the workflow path.
-      id-token: write # To sign the provenance.
-      contents: write # To add assets to a release.
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v1.4.0
+      id-token: write # For token creation.
+    outputs:
+      slsa-token: ${{ steps.generate.outputs.slsa-token }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate the token
+        id: generate
+        uses: slsa-framework/slsa-github-generator/actions/delegator/setup-generic@v2.0.0
+        with:
+          slsa-workflow-recipient: "delegator_generic_slsa3.yml"
+          slsa-rekor-log-public: ${{ inputs.rekor-log-public }}
+          slsa-runner-label: "ubuntu-latest"
+          slsa-build-action-path: "./internal/callback_action"
+          slsa-workflow-inputs: ${{ toJson(inputs) }}
+          slsa-workflow-masked-inputs: username
+
+  slsa-run:
+    needs: [slsa-setup]
+    permissions:
+      id-token: write # For signing.
+      contents: write # For asset uploads.
+      packages: write # For package uploads.
+      actions: read # For the entrypoint.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/delegator_generic_slsa3.yml@v2.0.0
     with:
-      base64-subjects: "${{ needs.build.outputs.digests }}"
-      upload-assets: true # Optional: Upload to a new release
+      slsa-token: ${{ needs.slsa-setup.outputs.slsa-token }}
+    secrets:
+      secret1: ${{ inputs.password }}
+      secret2: ${{ inputs.token }}
+
+  publish:
+    needs: [slsa-run]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write # For asset uploads.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download provenance
+        uses: slsa-framework/slsa-github-generator/actions/delegator/secure-attestations-download@v2.0.0
+        with:
+          name: ${{ needs.slsa-run.outputs.attestations-download-name }}
+          sha256: ${{ needs.slsa-run.outputs.attestations-download-sha256 }}
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUT: ${{ needs.slsa-run.outputs.attestations-download-name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          # Get the tag.
+          tag="$(echo $REF | cut -d '/' -f3-)"
+
+          # List attestations.
+          find "$OUT" -type f | tee ./FILES
+
+          # Upload attestations.
+          while IFS= read -r line; do
+              file="$line"
+              echo "Found attestation: $file"
+          done < FILES
